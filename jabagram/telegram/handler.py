@@ -24,6 +24,7 @@ from typing import Any
 from aiohttp import ClientConnectionError
 from datetime import datetime
 from gettext import gettext as _
+from jabagram.database.default_topics import DefaultTopicStorage
 from jabagram.database.messages import MessageIdEntry, MessageStorage
 from jabagram.model import ChatHandler, Event, Message, Attachment
 from jabagram.telegram.api import TelegramApi, TelegramApiError
@@ -61,18 +62,25 @@ class TelegramChatHandler(ChatHandler):
         address: str,
         api: TelegramApi,
         message_storage: MessageStorage,
+        default_topic_storage: DefaultTopicStorage,
     ) -> None:
         super().__init__(address)
         self.__address = address
         self.__message_storage = message_storage
         self.__logger = logging.getLogger(f"TelegramChatHandler ({address})")
         self.__api = api
+        self.__default_topic_storage = default_topic_storage
         self.__residence_map: dict[str, TopicTimeoutEntry] = {}
 
-    def __make_bold_sender_name(self, text: str):
+    def __make_sender_name_entities(self, text: str):
         message_entities = [
             {
                 "type": "bold",
+                "offset": 0,
+                "length": len(text)
+            },
+            {
+                "type": "underline",
                 "offset": 0,
                 "length": len(text)
             }
@@ -86,7 +94,7 @@ class TelegramChatHandler(ChatHandler):
         params: dict[str, Any] = {
             "text": f"{origin.sender.name}: {origin.text}",
             "chat_id": self.address,
-            "entities": self.__make_bold_sender_name(origin.sender.name)
+            "entities": self.__make_sender_name_entities(origin.sender.name)
         }
         entry = self.__residence_map.get(origin.sender.name)
 
@@ -123,6 +131,11 @@ class TelegramChatHandler(ChatHandler):
                         "type": "bold",
                         "offset": len(origin.reply) + 1,
                         "length": len(origin.sender.name)
+                    },
+                    {
+                        "type": "underline",
+                        "offset": len(origin.reply) + 1,
+                        "length": len(origin.sender.name)
                     }
                 ]
                 params["entities"] = dumps(format)
@@ -133,6 +146,11 @@ class TelegramChatHandler(ChatHandler):
             ):
                 params["message_thread_id"] = entry.topic_id
                 entry.time = datetime.now()
+
+        if 'message_thread_id' not in params:
+            dt = self.__default_topic_storage.get(int(self.__address))
+            if dt is not None:
+                params['message_thread_id'] = dt
 
         try:
             response = await self.__api.sendMessage(**params)
@@ -178,7 +196,7 @@ class TelegramChatHandler(ChatHandler):
                     params: dict[str, Any] = {
                         "chat_id": self.address,
                         "caption": caption,
-                        "caption_entities": self.__make_bold_sender_name(
+                        "caption_entities": self.__make_sender_name_entities(
                             attachment.sender.name
                         ),
                     }
@@ -190,6 +208,11 @@ class TelegramChatHandler(ChatHandler):
                     ):
                         params["message_thread_id"] = entry.topic_id
                         entry.time = datetime.now()
+
+                    if 'message_thread_id' not in params:
+                        dt = self.__default_topic_storage.get(int(self.__address))
+                        if dt is not None:
+                            params['message_thread_id'] = dt
 
                     if mime == "image/gif":
                         method = self.__api.sendAnimation
@@ -259,7 +282,7 @@ class TelegramChatHandler(ChatHandler):
             "chat_id": self.address,
             "text": f"{edited.sender.name}: {edited.text}",
             "message_id": result.telegram_id,
-            "entities": self.__make_bold_sender_name(edited.sender.name)
+            "entities": self.__make_sender_name_entities(edited.sender.name)
         }
 
         if edited.reply:
@@ -286,6 +309,11 @@ class TelegramChatHandler(ChatHandler):
                         "type": "bold",
                         "offset": len(edited.reply) + 1,
                         "length": len(edited.sender.name)
+                    },
+                    {
+                        "type": "underline",
+                        "offset": len(edited.reply) + 1,
+                        "length": len(edited.sender.name)
                     }
                 ]
                 params["entities"] = dumps(format)
@@ -304,10 +332,14 @@ class TelegramChatHandler(ChatHandler):
 
     async def send_event(self, event: Event) -> None:
         try:
-            await self.__api.sendMessage(
-                chat_id=self.address,
-                text=event.text
-            )
+            params: dict[str, Any] = {
+                "chat_id": self.address,
+                "text": event.text,
+            }
+            dt = self.__default_topic_storage.get(int(self.__address))
+            if dt is not None:
+                params["message_thread_id"] = dt
+            await self.__api.sendMessage(**params)
         except TelegramApiError as error:
             self.__logger.error(
                 "Failed to send event: %s", error

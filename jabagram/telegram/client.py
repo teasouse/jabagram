@@ -20,6 +20,7 @@ import logging
 import mimetypes
 
 from gettext import gettext as _
+from jabagram.database.default_topics import DefaultTopicStorage
 from jabagram.database.messages import MessageStorage
 from jabagram.database.topics import TopicNameCache
 from jabagram.dispatcher import MessageDispatcher
@@ -47,9 +48,11 @@ class TelegramClient(ChatHandlerFactory):
         dispatcher: MessageDispatcher,
         topic_name_cache: TopicNameCache,
         message_storage: MessageStorage,
+        default_topic_storage: DefaultTopicStorage,
     ) -> None:
         self.__api = TelegramApi(token)
         self.__token = token
+        self.__default_topic_storage = default_topic_storage
         self.__jid = jid
         self.__logger = logging.getLogger(__class__.__name__)
         self.__disptacher = dispatcher
@@ -68,6 +71,7 @@ class TelegramClient(ChatHandlerFactory):
             address=address,
             api=self.__api,
             message_storage=self.__message_storage,
+            default_topic_storage=self.__default_topic_storage,
         )
         self.__handlers[int(address)] = handler
         self.__disptacher.add_handler(muc, handler)
@@ -90,6 +94,36 @@ class TelegramClient(ChatHandlerFactory):
                 match update:
                     case {
                         "message": {
+                            "text": text,
+                            "chat": {
+                                "type": "group" | "supergroup",
+                                "id": chat
+                            },
+                        } as message
+                    } if text.startswith("/set_topic"):
+                        thread_id = message.get("message_thread_id")
+                        user_id = message.get("from", {}).get("id")
+                        await self.__set_topic_command(str(chat), text, thread_id, user_id)
+                    case {
+                        "message": {
+                            "text": text,
+                            "chat": {
+                                "type": "group" | "supergroup",
+                                "id": chat
+                            },
+                        } as message
+                    } if self.__disptacher.is_bound(str(chat)) \
+                            and text.startswith("/jabagram"):
+                        thread_id = message.get("message_thread_id")
+                        params = {"chat_id": str(chat), "text": "This chat is already bridged."}
+                        if thread_id is not None:
+                            params["message_thread_id"] = thread_id
+                        try:
+                            await self.__api.sendMessage(**params)
+                        except TelegramApiError:
+                            pass
+                    case {
+                        "message": {
                             "chat": {
                                 "type": "group" | "supergroup",
                                 "id": chat
@@ -104,10 +138,12 @@ class TelegramClient(ChatHandlerFactory):
                                 "type": "group" | "supergroup",
                                 "id": chat
                             },
-                        }
+                        } as message
                     } if not self.__disptacher.is_bound(str(chat)) \
                             and text.startswith("/jabagram"):
-                        await self.__bridge_command(str(chat), text)
+                        thread_id = message.get("message_thread_id")
+                        user_id = message.get("from", {}).get("id")
+                        await self.__bridge_command(str(chat), text, thread_id, user_id)
                     case {
                         "edited_message": {
                             "chat": {
@@ -129,7 +165,32 @@ class TelegramClient(ChatHandlerFactory):
 
             params["offset"] = updates[len(updates) - 1]['update_id'] + 1
 
-    async def __bridge_command(self, chat_id: str, cmd: str) -> None:
+    async def __is_admin(self, chat_id: str, user_id: int | None) -> bool:
+        """Check if user is an admin or creator of the chat."""
+        if user_id is None:
+            return False
+        try:
+            member = await self.__api.getChatMember(
+                chat_id=chat_id, user_id=user_id
+            )
+            return member.get("status", "") in ("creator", "administrator")
+        except TelegramApiError:
+            return False
+
+    async def __bridge_command(self, chat_id: str, cmd: str, reply_thread_id: int | None = None, user_id: int | None = None) -> None:
+        async def reply(text: str):
+            params = {"chat_id": chat_id, "text": text}
+            if reply_thread_id is not None:
+                params["message_thread_id"] = reply_thread_id
+            await self.__api.sendMessage(**params)
+
+        if not await self.__is_admin(chat_id, user_id):
+            try:
+                await reply("Only admins can use this command.")
+            except TelegramApiError:
+                pass
+            return
+
         try:
             try:
                 muc_address = cmd.split(" ")[1]
@@ -139,37 +200,59 @@ class TelegramClient(ChatHandlerFactory):
 
                 self.__service.pending(muc_address, chat_id)
 
-                await self.__api.sendMessage(
-                    chat_id=chat_id,
-                    text=_(
-                        "Specified room has been successfully placed on the queue."
-                        " Please invite this {} bot to your XMPP room,"
-                        " and as the reason for the invitation specify the secret key"
-                        " that is specified in bot's config or ask the owner"
-                        " of this bridge instance for it.\n\n"
-                        "If you have specified an incorrect room address, simply repeat"
-                        " the pair command (/jabagram) with the corrected address."
-                    ).format(self.__jid)
-                )
+                await reply(_(
+                    "Specified room has been successfully placed on the queue."
+                    " Please invite this {} bot to your XMPP room,"
+                    " and as the reason for the invitation specify the secret key"
+                    " that is specified in bot's config or ask the owner"
+                    " of this bridge instance for it.\n\n"
+                    "If you have specified an incorrect room address, simply repeat"
+                    " the pair command (/jabagram) with the corrected address."
+                ).format(self.__jid))
             except IndexError:
-                await self.__api.sendMessage(
-                    chat_id=chat_id,
-                    text=_(
-                        "Please specify the MUC address of room "
-                        "you want to pair with this Telegram chat."
-                    )
-                )
+                await reply(_(
+                    "Please specify the MUC address of room "
+                    "you want to pair with this Telegram chat."
+                ))
             except InvalidJID:
-                await self.__api.sendMessage(
-                    "sendMessage", chat_id=chat_id,
-                    text=_(
-                        "You have specified an incorrect room JID. "
-                        "Please try again."
-                    )
-                )
+                await reply(_(
+                    "You have specified an incorrect room JID. "
+                    "Please try again."
+                ))
         except TelegramApiError as error:
             self.__logger.error(
                 "Error processing the bridge command: %s", error
+            )
+
+    async def __set_topic_command(self, chat_id: str, cmd: str, reply_thread_id: int | None = None, user_id: int | None = None) -> None:
+        async def reply(text: str):
+            params = {"chat_id": chat_id, "text": text}
+            if reply_thread_id is not None:
+                params["message_thread_id"] = reply_thread_id
+            try:
+                await self.__api.sendMessage(**params)
+            except TelegramApiError:
+                pass
+
+        if not await self.__is_admin(chat_id, user_id):
+            await reply("Only admins can use this command.")
+            return
+
+        try:
+            parts = cmd.split()
+            if len(parts) < 2 or parts[1] == "0":
+                self.__default_topic_storage.remove(int(chat_id))
+                await reply("Default topic removed for this chat")
+            else:
+                try:
+                    thread_id = int(parts[1])
+                    self.__default_topic_storage.set(int(chat_id), thread_id)
+                    await reply(f"Default topic set to {thread_id} for this chat")
+                except ValueError:
+                    await reply("Usage: /set_topic <thread_id> or /set_topic 0 to remove")
+        except TelegramApiError as error:
+            self.__logger.error(
+                "Error processing the set_topic command: %s", error
             )
 
     def __extract_attachment(

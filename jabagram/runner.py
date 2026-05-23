@@ -23,6 +23,7 @@ import logging
 import gettext
 
 from jabagram.database.chats import ChatStorage
+from jabagram.database.default_topics import DefaultTopicStorage
 from jabagram.database.messages import MessageStorage
 from jabagram.database.stickers import StickerCache
 from jabagram.database.topics import TopicNameCache
@@ -83,12 +84,14 @@ def main():
             config.read_file(f)
 
         chat_storage = ChatStorage(path=args.data)
+        default_topic_storage = DefaultTopicStorage(path=args.data)
         sticker_cache = StickerCache(path=args.data)
         topic_name_cache = TopicNameCache(path=args.data)
         message_storage = MessageStorage(path=args.data)
 
         if not all([
             chat_storage.create(),
+            default_topic_storage.create(),
             sticker_cache.create(),
             topic_name_cache.create(),
             message_storage.create()
@@ -123,7 +126,8 @@ def main():
             service=service,
             dispatcher=dispatcher,
             message_storage=message_storage,
-            topic_name_cache=topic_name_cache
+            topic_name_cache=topic_name_cache,
+            default_topic_storage=default_topic_storage,
         )
         xmpp = XmppClient(
             jid=config.get("xmpp", "login"),
